@@ -1,0 +1,1393 @@
+# -*- coding: utf-8 -*-
+
+# %% libraries
+import pymysql
+from sqlalchemy import create_engine
+
+import os
+import glob
+import gc
+import numpy as np
+import pandas as pd
+
+import datetime
+from datetime import date
+from dateutil.relativedelta import relativedelta
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# scaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
+# savgol 스무딩
+from scipy import signal
+from scipy.signal import savgol_filter
+
+# seed
+import random
+
+# ridge
+from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import LinearRegression, Ridge
+
+# xgb
+import xgboost as xgb
+from xgboost import XGBRegressor
+
+# LightGBM
+from lightgbm import LGBMRegressor
+
+# prophet
+from prophet import Prophet
+import random
+
+# arima
+from statsmodels.tsa.arima_model import ARIMA
+import statsmodels.api as sm
+import pmdarima as pm
+
+# %% common def
+def target_name_change(item_name:str, target_name:str): #version_new
+    item_name = item_name.lower()
+    target_name = target_name.lower()
+
+    con_mapping_columns = {'imp': '적_수입',
+                           'exp': '적_수출',
+                           'cst': '적_연안',
+                           'trn': '적_환적'}
+    mapping_columns = {'imp': '수입',
+                       'exp': '수출',
+                       'cst': '연안',
+                       'trn': '환적'}
+    try:
+        if item_name == 'container':
+            try:
+               changed_name = [k for k, v in con_mapping_columns.items() if v == target_name][0]
+            except:
+               changed_name = [v for k, v in con_mapping_columns.items() if k == target_name][0]
+        else:
+            try:
+               changed_name = [k for k, v in mapping_columns.items() if v == target_name][0]
+            except:
+               changed_name = [v for k, v in mapping_columns.items() if k == target_name][0]
+        return changed_name
+    except Exception as e:
+        print(f"Cant change name {target_name}: ", e)
+
+def item_name_change(item_name:str):
+    item_name = item_name.lower()
+    mapping_columns = {'container': '컨테이너',
+                       'metal': '고철',
+                       'oil': '유류',
+                       'car': '자동차',
+                       'cement':'시멘트',
+                       'coal': '석탄',
+                       'etc': '잡화'}
+    try:
+        try:
+           changed_name = [k for k, v in mapping_columns.items() if v == item_name][0] #ENG to KR
+        except:
+           changed_name = [v for k, v in mapping_columns.items() if k == item_name][0] #KR to ENG
+        return changed_name
+    except Exception as e:
+        print(f"Cant change name {item_name}: ", e)
+
+def datamart_datetype(df, date_name):
+    if 'ym' in df.columns:
+        df[date_name] = pd.to_datetime(df[date_name], errors='coerce')
+    else:  # year
+        df[date_name] = pd.to_datetime(df[date_name].astype(str) + '-01-01', errors='coerce')
+    return df
+
+# kmi_df 처리
+def kmi_df_update(kmi_df):  # original, kr
+    # 연월 처리
+    kmi_df['MONTH'] = kmi_df['MONTH'].apply(lambda x: '0' + str(x) if int(x) < 10 else str(x))
+    kmi_df['ym'] = kmi_df['YEAR'].astype(str) + '-' + kmi_df['MONTH']
+    kmi_df = datamart_datetype(kmi_df, 'ym')
+    kmi_df = kmi_df[kmi_df['ym'] >= '2000-01'].reset_index(drop=True)
+
+    if 'ITEM_TYPE' not in kmi_df.columns:
+        # 컨테이너용
+        kmi_df = kmi_df[['INDEX', 'YEAR', 'MONTH', 'HARBOR', 'IMPORT_EXPORT', 'INNER_OUTER',
+                         'ARRIVAL_DEPARTURE', 'TEU_FILL', 'TEU_EMPTY', 'TEU_TOTAL', 'ym']]
+        kmi_df['ITEM_TYPE'] = '컨테이너'
+        kmi_df.loc[(kmi_df['ITEM_TYPE'] == '컨테이너') & (kmi_df['IMPORT_EXPORT'] == '수입환적'), 'IMPORT_EXPORT'] = '환적'
+        kmi_df.loc[(kmi_df['ITEM_TYPE'] == '컨테이너') & (kmi_df['IMPORT_EXPORT'] == '수출환적'), 'IMPORT_EXPORT'] = '환적'
+        ## 월별 합
+        kmi_df_kr = kmi_df.groupby(['ym', 'ITEM_TYPE', 'IMPORT_EXPORT'])[
+            ['TEU_FILL', 'TEU_EMPTY', 'TEU_TOTAL']].sum().reset_index()
+
+    else:
+        ##품목별 수출입별 sum
+        # 기계잡화
+        etc_li = ['비철금속 및 그제품', '기계류 및 그부품', '전기기기 및 그부품', '항공기.선박 및 부품']
+        etc_df = kmi_df[
+            (kmi_df['ITEM_TYPE'] == '잡화') & (kmi_df['ITEM_DETAIL'].str.contains('|'.join(etc_li)))].reset_index(
+            drop=True)
+        # 유류: 수출에서만 원유 제외, 나머지는 유류전체
+        oil_ex = kmi_df[(kmi_df['ITEM_TYPE'] == '유류') & (kmi_df['IMPORT_EXPORT'] == '수출') & (
+                    kmi_df['ITEM_DETAIL'] != '원유(역청유). 석유')].reset_index(drop=True)  # 원유
+        oil_df = kmi_df[(kmi_df['ITEM_TYPE'] == '유류') & (kmi_df['IMPORT_EXPORT'] != '수출')].reset_index(
+            drop=True)  # 수출아닌거
+        oil_df = pd.concat([oil_ex, oil_df], ignore_index=True)
+        del oil_ex
+        # 나머지(유류, 잡화 제외)
+        kmi_df = kmi_df[~kmi_df['ITEM_TYPE'].isin(['유류', '잡화'])].reset_index(drop=True)
+        kmi_df = pd.concat([kmi_df, etc_df, oil_df], ignore_index=True)
+        del etc_df, oil_df, etc_li
+
+        ## 수출입 구분 변경
+        # 자동차 수출입 구분 변경
+        kmi_df.loc[(kmi_df['ITEM_TYPE'] == '자동차') & (kmi_df['IMPORT_EXPORT'] == '수입환적'), 'IMPORT_EXPORT'] = '환적'
+        kmi_df.loc[(kmi_df['ITEM_TYPE'] == '자동차') & (kmi_df['IMPORT_EXPORT'] == '수출환적'), 'IMPORT_EXPORT'] = '환적'
+        # 나머지 수출입 구분 변경
+        kmi_df.loc[(kmi_df['ITEM_TYPE'] != '자동차') & (kmi_df['IMPORT_EXPORT'] == '수입환적'), 'IMPORT_EXPORT'] = '수입'
+        kmi_df.loc[(kmi_df['ITEM_TYPE'] != '자동차') & (kmi_df['IMPORT_EXPORT'] == '수출환적'), 'IMPORT_EXPORT'] = '수출'
+        ## 월별 합
+        kmi_df_kr = kmi_df.groupby(['ym', 'ITEM_TYPE', 'IMPORT_EXPORT'])['NON_CONTAINER'].sum().reset_index()
+
+    kmi_df_kr['HARBOR'] = '전국'
+    kmi_df_kr.loc[kmi_df_kr['ITEM_TYPE'] == '잡화', 'ITEM_DETAIL'] = '기계잡화'
+    kmi_df_kr.loc[kmi_df_kr['ITEM_TYPE'] != '잡화', 'ITEM_DETAIL'] = '전체'
+    return kmi_df, kmi_df_kr
+
+# top-down csv 파일 생성
+def forecast_csv_topdown(data:pd.DataFrame, percen_df:pd.DataFrame, item_detail:str, item_type:str, import_export:str,
+                                      pred_col:str, short_model:str, short_end_date:str, long_model:str, long_end_date:str, kmi_update:str):
+    if item_type == '컨테이너':
+        item_temp = item_name_change(item_type)
+        impexp_name_eng = target_name_change(item_name=item_temp, target_name=import_export)
+        impexp_temp = target_name_change(item_name=item_type, target_name=impexp_name_eng)
+        # 전국
+        kr_data = data.copy()
+        kr_data = datamart_datetype(kr_data, date_name)
+        kr_data = kr_data[kr_data['ym'] <= long_end_date]
+        kr_data['YEAR'] = kr_data['ym'].astype(str).str[0:4].astype(int)
+        kr_data['MONTH'] = kr_data['ym'].astype(str).str[5:7].astype(int)
+        kr_data['HARBOR'] = '전국'
+        kr_data['MODEL_IDX'] = kmi_update
+        kr_data.loc[kr_data['ym'] <= short_end_date, 'MODEL_TYPE'] = 'short'
+        kr_data['MODEL_TYPE'] = kr_data['MODEL_TYPE'].fillna('long')
+        kr_data.loc[kr_data['MODEL_TYPE'] == 'short', 'MODEL_NM'] = short_model
+        kr_data['MODEL_NM'] = kr_data['MODEL_NM'].fillna(long_model)
+        kr_data['FORECAST_TYPE'] = 'top_down'
+        kr_data['IMPORT_EXPORT'] = impexp_temp
+        kr_data = kr_data.rename(columns={pred_col: 'FORECAST_TEU_FILL'})
+        kr_data['FORECAST_TEU_FILL'] = kr_data['FORECAST_TEU_FILL'].astype(int)
+        kr_data = kr_data.sort_values(by=['IMPORT_EXPORT', 'YEAR', 'MONTH', 'HARBOR'])
+        kr_data['FORECAST_TEU_EMPTY'] = np.nan
+        kr_data['FORECAST_TEU_TOTAL'] = np.nan
+    else:
+        # 전국
+        kr_data = data.copy()
+        kr_data = datamart_datetype(kr_data, date_name)
+        kr_data = kr_data[kr_data['ym'] <= long_end_date]
+        kr_data['YEAR'] = kr_data['ym'].astype(str).str[0:4].astype(int)
+        kr_data['MONTH'] = kr_data['ym'].astype(str).str[5:7].astype(int)
+        kr_data['HARBOR'] = '전국'
+        kr_data['MODEL_IDX'] = kmi_update
+        kr_data.loc[kr_data['ym'] <= short_end_date, 'MODEL_TYPE'] = 'short'
+        kr_data['MODEL_TYPE'] = kr_data['MODEL_TYPE'].fillna('long')
+        kr_data.loc[kr_data['MODEL_TYPE']=='short', 'MODEL_NM'] = short_model
+        kr_data['MODEL_NM'] = kr_data['MODEL_NM'].fillna(long_model)
+        kr_data['FORECAST_TYPE'] = 'top_down'
+        kr_data['ITEM_TYPE'] = item_type
+        kr_data['ITEM_DETAIL'] = item_detail
+        kr_data['IMPORT_EXPORT'] = import_export
+        kr_data = kr_data.rename(columns={pred_col: 'FORECAST_NON_CONTAINER'})
+        kr_data['FORECAST_NON_CONTAINER'] = kr_data['FORECAST_NON_CONTAINER'].astype(int)
+        kr_data = kr_data.sort_values(by=['IMPORT_EXPORT', 'YEAR', 'MONTH', 'HARBOR'])
+
+    if item_type == '컨테이너':
+        kr_data = kr_data[['MODEL_IDX', 'YEAR', 'MONTH', 'IMPORT_EXPORT', 'HARBOR', 'MODEL_NM', 'MODEL_TYPE',
+                           'FORECAST_TYPE', 'FORECAST_TEU_FILL', 'FORECAST_TEU_EMPTY', 'FORECAST_TEU_TOTAL']]
+    else:
+        kr_data = kr_data[['MODEL_IDX', 'YEAR', 'MONTH', 'ITEM_TYPE', 'ITEM_DETAIL', 'IMPORT_EXPORT', 'HARBOR',
+                           'MODEL_NM', 'MODEL_TYPE','FORECAST_TYPE', 'FORECAST_NON_CONTAINER']]
+    kr_data['CREATED_DATE'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    kr_data['CREATED_DATE'] = pd.to_datetime(kr_data['CREATED_DATE'])
+
+    # 항만별
+    # 최근 항만 비중 적용하여 배분
+    percen_df2 = percen_df[(percen_df['ITEM_TYPE'] == item_type) & (percen_df['ITEM_DETAIL'] == item_detail) &
+                           (percen_df['IMPORT_EXPORT'] == import_export)]
+    max_date = percen_df2['BASE_YEAR'].max()
+    percen_df2 = percen_df2[percen_df2['BASE_YEAR'] == max_date]
+    percen_dict = dict(zip(percen_df2['HARBOR'], percen_df2['HARBOR_RATIO']))
+
+    ### 항만배분 datafrmae
+    harbor_data = pd.DataFrame()
+    if item_type == '컨테이너':
+        for key, value in percen_dict.items():
+            data2 = kr_data.copy()
+            data2['HARBOR'] = data2['HARBOR'].replace('전국', key)
+            data2['FORECAST_TEU_FILL'] = data2['FORECAST_TEU_FILL'] * value
+            harbor_data = pd.concat([harbor_data, data2], axis=0)
+    else:
+        for key, value in percen_dict.items():
+            data2 = kr_data.copy()
+            data2['HARBOR'] = data2['HARBOR'].replace('전국', key)
+            data2['FORECAST_NON_CONTAINER'] = data2['FORECAST_NON_CONTAINER'] * value
+            harbor_data = pd.concat([harbor_data, data2], axis=0)
+    return kr_data, harbor_data
+
+# bottom-up csv 파일 생성
+#항만
+def forecast_csv_bottomup_hb(data:pd.DataFrame, pt:str, item_detail:str, item_type:str, import_export:str,pred_col:str,
+                             short_model:str, short_end_date:str, long_model:str, long_end_date:str, kmi_update:str):
+    # 항만별 예측 결과 저장
+    hb_data = data.copy()
+    hb_data = datamart_datetype(hb_data, date_name)
+    hb_data = hb_data[hb_data['ym'] <= long_end_date]
+    hb_data['YEAR'] = hb_data['ym'].astype(str).str[0:4].astype(int)
+    hb_data['MONTH'] = hb_data['ym'].astype(str).str[5:7].astype(int)
+    hb_data['HARBOR'] = pt
+    hb_data['MODEL_IDX'] = kmi_update
+    hb_data.loc[hb_data['ym'] <= short_end_date, 'MODEL_TYPE'] = 'short'
+    hb_data['MODEL_TYPE'] = hb_data['MODEL_TYPE'].fillna('long')
+    hb_data.loc[hb_data['MODEL_TYPE'] == 'short', 'MODEL_NM'] = short_model
+    hb_data['MODEL_NM'] = hb_data['MODEL_NM'].fillna(long_model)
+    hb_data['FORECAST_TYPE'] = 'bottom_up'
+    hb_data['ITEM_TYPE'] = item_type
+    hb_data['ITEM_DETAIL'] = item_detail
+    hb_data['IMPORT_EXPORT'] = target_name
+    hb_data = hb_data.rename(columns={pred_col: 'FORECAST_NON_CONTAINER'})
+    hb_data['FORECAST_NON_CONTAINER'] = hb_data['FORECAST_NON_CONTAINER'].astype(int)
+    hb_data = hb_data.sort_values(by=['IMPORT_EXPORT', 'YEAR', 'MONTH', 'HARBOR'])
+    hb_data = hb_data[['MODEL_IDX', 'YEAR', 'MONTH', 'ITEM_TYPE', 'ITEM_DETAIL', 'IMPORT_EXPORT', 'HARBOR', 'MODEL_NM',
+                       'MODEL_TYPE', 'FORECAST_TYPE', 'FORECAST_NON_CONTAINER']]
+    hb_data['CREATED_DATE'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    hb_data['CREATED_DATE'] = pd.to_datetime(hb_data['CREATED_DATE'])
+    return hb_data
+
+#전국
+def forecast_csv_bottomup_kr(data:pd.DataFrame, item_detail:str, item_type:str, import_export:str, pred_col:str,
+                             short_model:str, short_end_date:str, long_model:str, long_end_date:str, kmi_update:str):
+    # 항만별 예측 결과 저장
+    harbor_kr_tot = data.copy()
+    kr_tot = pd.pivot_table(harbor_kr_tot, index=['YEAR', 'MONTH'], values='FORECAST_NON_CONTAINER',
+                            columns=['HARBOR']).reset_index()
+    kr_tot['FORECAST_NON_CONTAINER'] = kr_tot.iloc[:, 2:].sum(axis=1)
+    kr_tot['FORECAST_TYPE'] = 'bottom_up'
+    kr_tot['HARBOR'] = '전국'
+    kr_tot['MODEL_IDX'] = kmi_update
+    kr_tot['MODEL_NM'] = 'bottom_up'
+    kr_tot.loc[(kr_tot['YEAR'].astype(str) <= short_end_date[0:4]), 'MODEL_TYPE'] = 'short'
+    kr_tot['MODEL_TYPE'] = kr_tot['MODEL_TYPE'].fillna('long')
+    kr_tot['ITEM_DETAIL'] = item_detail
+    kr_tot['ITEM_TYPE'] = item_type
+    kr_tot['IMPORT_EXPORT'] = target_name
+    kr_tot['FORECAST_NON_CONTAINER'] = kr_tot['FORECAST_NON_CONTAINER'].astype(int)
+    kr_tot = kr_tot.sort_values(by=['IMPORT_EXPORT', 'YEAR', 'MONTH', 'HARBOR'])
+    kr_tot = kr_tot[['MODEL_IDX', 'YEAR', 'MONTH', 'ITEM_TYPE', 'ITEM_DETAIL', 'IMPORT_EXPORT', 'HARBOR',
+                      'MODEL_NM', 'MODEL_TYPE','FORECAST_TYPE', 'FORECAST_NON_CONTAINER']]
+    kr_tot['CREATED_DATE'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    kr_tot['CREATED_DATE'] = pd.to_datetime(kr_tot['CREATED_DATE'])
+    return kr_tot
+
+def fix_end_date(kmi_update: str, base_train_end='2022-10', base_test_end='2025-12', base_test_end_l='2050-12'):
+    model_year = int(kmi_update[:4]) - 2023
+    if model_year < 1:  # 1년마다 모델 업데이트
+        fix_train_end = base_train_end
+    else:
+        fix_train_end = str(np.datetime64(base_train_end) + np.timedelta64(model_year, 'Y'))
+        fix_train_end = fix_train_end[:4] + '-12'
+
+    if int(kmi_update[3:4]) in [0, 5]:  # 5년단위 단기
+        fix_test_end = str(np.datetime64(base_test_end) + np.timedelta64(5, 'Y'))
+    else:
+        fix_test_end = base_test_end
+    return fix_train_end, fix_test_end, base_test_end_l
+
+
+def savgol_smth(start_date_smth: str, train_end_date: str, mart: pd.DataFrame, target_name: str, date_nm: str,
+                win_no: int, poly_no: int):
+    mart = datamart_datetype(mart, date_nm)
+
+    # 스무딩하고싶은곳 +12개월(뒷부분 삭제돼서)
+    end_date_smth = pd.to_datetime(train_end_date) + pd.DateOffset(months=12)
+    smth_prep_y = mart.loc[mart[date_nm] == train_end_date, target_name].values[0]
+    # 스무딩 진행한 y값
+    data_s = mart[(mart[date_nm] >= start_date_smth) & (mart[date_nm] <= str(end_date_smth))].reset_index(drop=True)
+    data_s.loc[(data_s[date_nm] > train_end_date) & (data_s[date_nm] <= str(end_date_smth)), target_name] = smth_prep_y
+    smth_y = savgol_filter(data_s[target_name], win_no, poly_no, mode='nearest')
+    data_s[f'{target_name}_smth'] = smth_y
+    # 스무딩 결과가 0이면 원래 값으로
+    data_s.loc[data_s[f'{target_name}_smth'] < 0, f'{target_name}_smth'] = data_s[target_name]
+    data_s = data_s[(data_s[date_nm] >= start_date_smth) & (data_s[date_nm] <= train_end_date)].reset_index(
+        drop=True).drop(columns=[target_name])
+    data_s = data_s[[date_nm, f'{target_name}_smth']]
+    mart = pd.merge(mart, data_s, on=date_nm, how='left')
+
+    mart.loc[mart[f'{target_name}_smth'].isnull() == False, target_name] = mart[f'{target_name}_smth']
+    anal_df = mart.drop(columns=[f'{target_name}_smth'])
+    return anal_df
+
+def smooth_data_np_average(arr, span):  # my original, naive approach
+    return [np.average(arr[val - span:val + span + 1]) for val in range(len(arr))]
+
+
+### 단변량 함수
+# xgb, lgbm 단변량 모델에 필요 - 데이터 1차 가공 (time series로 변환)
+def ts_data_preprocessing(model_data, date_name, target_name):
+    model_data[date_name] = pd.to_datetime(model_data[date_name])
+    model_data = model_data.set_index(date_name)
+
+    result_df = model_data[[target_name]]
+    return result_df
+
+# xgb, lgbm 단변량 모델에 필요 - time series를 지도학습 데이터로 변환
+def series_to_supervised(values, n_in=1, n_out=1, dropnan=True):
+    n_vars = 1 if type(values) is list else values.shape
+    df = pd.DataFrame(values)
+    cols = list()
+    # input sequence (t-n, ... t-1)
+    for i in range(n_in, 0, -1):
+        cols.append(df.shift(i))
+    # forecast sequence (t, t+1, ... t+n)
+    for i in range(0, n_out):
+        cols.append(df.shift(-i))
+    # 병합
+    agg = pd.concat(cols, axis=1)
+    # NaN 제거
+    if dropnan:
+        agg.dropna(inplace=True)
+    return agg.values
+
+# xgb 단변량
+def xgb_ts_model(model_data: pd.DataFrame, item_name:str, target_name: str, date_name: str,
+                 train_start_date: str, train_end_date: str, pred_year: int, lag=3):
+    df = ts_data_preprocessing(model_data, date_name, target_name)
+    train_df = df[train_start_date:train_end_date]
+
+    periods = pred_year * 12
+    values = train_df.values
+    preds = []
+    for i in range(periods):
+        train = series_to_supervised(values, n_in=lag)
+        trainX, trainy = train[:, :-1], train[:, -1]
+        model = XGBRegressor(objective='reg:squarederror', n_estimators=1000, random_state=42)
+
+        model.fit(trainX, trainy)
+        row = values[-lag:].flatten()
+        yhat = model.predict(np.array([row]))
+
+        if yhat < 0:
+            yhat = np.array([0])
+        else:
+            yhat
+
+        values = np.append(values, yhat)
+        preds.append(yhat.item())
+
+    # 월별 예측값 저장
+    test_start_date = str(np.datetime64(train_end_date) + np.timedelta64(1, 'M'))
+    pred_idx = pd.date_range(start=test_start_date, periods=periods, freq='MS').tolist()
+    pred_df = pd.DataFrame({'ym': pred_idx, 'predict': preds})
+    return pred_df
+
+# lgbm 단변량
+def lgbm_ts_model(model_data: pd.DataFrame, item_name:str, target_name: str, date_name: str,
+                  train_start_date: str, train_end_date: str, pred_year: int, lag=3):
+    df = ts_data_preprocessing(model_data, date_name, target_name)
+    train_df = df[train_start_date:train_end_date]
+
+    periods = pred_year * 12
+    values = train_df.values
+    preds = []
+    for i in range(periods):
+        train = series_to_supervised(values, n_in=lag)
+        trainX, trainy = train[:, :-1], train[:, -1]
+        model = LGBMRegressor(objective='regression', n_estimators=1000, random_state=42)
+
+        model.fit(trainX, trainy)
+        row = values[-lag:].flatten()
+        yhat = model.predict(np.array([row]))
+
+        if yhat < 0:
+            yhat = np.array([0])
+        else:
+            yhat
+
+        values = np.append(values, yhat)
+        preds.append(yhat.item())
+
+    # 월별 예측값 저장
+    test_start_date = str(np.datetime64(train_end_date) + np.timedelta64(1, 'M'))
+    pred_idx = pd.date_range(start=test_start_date, periods=periods, freq='MS')
+    pred_df = pd.DataFrame({'ym': pred_idx, 'predict': preds})
+    return pred_df
+
+# prophet
+def prophet_model(model_data: pd.DataFrame, item_name:str, target_name: str, date_name: str, train_start_date: str,
+                  train_end_date: str, pred_year: int):
+    anal_df = model_data[[date_name, target_name]]
+    anal_df = datamart_datetype(anal_df, date_name)
+    anal_df.columns = ['ds', 'y']
+    # train/test set 분리
+    train_set = anal_df[(anal_df['ds'] >= str(train_start_date)) & (anal_df['ds'] <= str(train_end_date))]  # 이상, 이하
+    test_set = anal_df[(anal_df['ds'] > str(train_end_date))]  # 초과
+    try:
+        # model train
+        baseline_model = Prophet(weekly_seasonality=False, daily_seasonality=False)
+        baseline_model.fit(train_set)
+        # model predict
+        if date_name == 'ym':
+            future = baseline_model.make_future_dataframe(periods=pred_year * 12, freq='MS')  # 월타입
+        else:
+            future = baseline_model.make_future_dataframe(periods=pred_year, freq='YS')  # 연타입
+        forecast = baseline_model.predict(future)
+        forecast = forecast[forecast['ds'] > str(train_end_date)][['ds', 'yhat']].reset_index(drop=True)
+        forecast.columns = [date_name, 'predict']
+        forecast['predict'] = forecast['predict'].apply(lambda x: 0 if x < 0 else x)
+        return forecast
+    except Exception as e:  
+        print("cant run 'prophet model': ", e)
+
+
+# auto-arima
+def arima_model(model_data: pd.DataFrame, item_name:str, target_name: str, date_name: str, train_start_date: str, train_end_date: str,
+                pred_year: int, max_p=5, max_d=5, max_q=5):
+    if date_name == 'ym':
+        pred_month = 12 * pred_year
+    else:
+        pred_month = pred_year
+
+    model_data = model_data[[date_name, target_name]]
+    model_data = datamart_datetype(model_data, date_name)
+    train = \
+    model_data[(model_data[date_name] >= str(train_start_date)) & (model_data[date_name] <= str(train_end_date))][
+        [date_name, target_name]]  # 이상, 이하
+    test = model_data[(model_data[date_name] > str(train_end_date))][[date_name, target_name]]  # 초과
+    
+    try:
+        if max_d == 0:
+            model = pm.auto_arima(y=train[target_name],
+                                  start_p=0,
+                                  max_p=max_p,
+                                  d=max_d,
+                                  start_q=0,
+                                  max_q=max_q,
+                                  seasonal=False,
+                                  stepwise=True)
+        else:
+            model = pm.auto_arima(y=train[target_name],
+                                  start_p=0,
+                                  max_p=max_p,
+                                  strat_d=0,
+                                  max_d=max_d,
+                                  start_q=0,
+                                  max_q=max_q,
+                                  seasonal=False,
+                                  stepwise=True)
+
+        model.fit(train[target_name])
+        pdq_info = model.order
+
+        # 실제(test) 예측값(predict)
+        # date key
+        if date_name == 'ym':
+            date_range = list(
+                pd.date_range(start=train_end_date, end=np.datetime64(train_end_date) + np.timedelta64(pred_month, 'M'),
+                              freq='MS'))
+        else:
+            date_range = list(
+                pd.date_range(start=train_end_date, end=np.datetime64(train_end_date) + np.timedelta64(pred_month, 'Y'),
+                              freq='YS'))
+
+        pred_df = pd.DataFrame({date_name: date_range[1:],
+                                'predict': model.predict(n_periods=pred_month)})
+        return pred_df
+    except Exception as e:  
+        print("cant run 'arima model': ", e)
+
+
+### 다변량 함수
+# 다변량 xgboost model
+def xgb_model(model_data:pd.DataFrame, item_name:str, target_name:str, date_name:str, train_start_date:str, train_end_date:str, test_start_date:str, test_end_date:str):
+    global pred_df
+    # train / test set 분리
+    x_list = list(model_data.columns)
+    x_list.remove(target_name)
+    x_data = model_data[x_list]
+    try:
+        x = x_data.drop(columns=[date_name, '항만명', '품목'])
+    except:
+        x = x_data.drop(columns=[date_name, '항만명'])
+
+    model_data = datamart_datetype(model_data, date_name)
+
+    trainset = model_data[(model_data[date_name] >= train_start_date) & (model_data[date_name] <= train_end_date)]
+    train_x = trainset[x.columns]
+    train_y = trainset[target_name]
+
+    testset = model_data[(model_data[date_name] >= test_start_date) & (model_data[date_name] <= test_end_date)]
+    test_x = testset[x.columns]
+    test_y = testset[target_name]
+    try:
+        # 모델 학습
+        model = XGBRegressor(objective='reg:squarederror', n_estimators=1000, random_state=42)
+        model.fit(train_x, train_y)
+        y_pred = model.predict(test_x)
+
+        temp_df = pd.DataFrame(y_pred, index=test_y.index)
+        temp_df = temp_df.rename(columns={0: 'predict'})
+        df = pd.concat([testset, temp_df], axis=1)
+        df.loc[df['predict'] < 0, 'predict'] = 0
+
+        pred_df = df[[date_name, 'predict']]
+        return pred_df
+    except Exception as e:  
+        print("cant run 'xgboost model': ", e)
+
+
+# 다변량 ridge model
+def ridge_model(model_data:pd.DataFrame, item_name:str, target_name:str, date_name:str, train_start_date:str, train_end_date:str, test_start_date:str, test_end_date:str):
+    global pred_df
+    # train / test set 분리
+    x_list = list(model_data.columns)
+    x_list.remove(target_name)
+    x_data = model_data[x_list]
+    try:
+        x = x_data.drop(columns=[date_name, '항만명', '품목'])
+    except:
+        x = x_data.drop(columns=[date_name, '항만명'])
+
+    model_data = datamart_datetype(model_data, date_name)
+
+    trainset = model_data[(model_data[date_name] >= train_start_date) & (model_data[date_name] <= train_end_date)]
+    train_x = trainset[x.columns]
+    train_y = trainset[target_name]
+
+    testset = model_data[(model_data[date_name] >= test_start_date) & (model_data[date_name] <= test_end_date)]
+    test_x = testset[x.columns]
+    test_y = testset[target_name]
+    try:
+        # 모델 학습
+        model = Ridge(random_state=42)
+        parameters = {'alpha': np.arange(0.01, 10, 0.01)}
+        model = GridSearchCV(model, parameters, cv=5)
+        model.fit(train_x, train_y)
+
+        best_param = model.best_params_
+        ridge_best_model = Ridge(**best_param, random_state=42)
+        ridge_best_model.fit(train_x, train_y)
+        y_pred = ridge_best_model.predict(test_x)
+
+        temp_df = pd.DataFrame(y_pred, index=test_y.index)
+        temp_df = temp_df.rename(columns={0: 'predict'})
+        df = pd.concat([testset, temp_df], axis=1)
+        df.loc[df['predict'] < 0, 'predict'] = 0
+
+        pred_df = df[[date_name, 'predict']]
+        return pred_df
+    except Exception as e: 
+        print("cant run 'ridge model': ", e)
+        pass
+
+def model_running(model_name, **kwargs):
+    global result_df
+    try:
+        if model_name == 'xgboost':
+            result_df = xgb_model(**kwargs)
+        elif model_name == 'ridge':
+            result_df = ridge_model(**kwargs)
+        elif model_name == 'arima':
+            result_df = arima_model(**kwargs)
+        elif model_name == 'prophet':
+            result_df = prophet_model(**kwargs)
+        elif model_name == 'xgboostts':
+            result_df = xgb_ts_model(**kwargs)
+        else:
+            result_df = lgbm_ts_model(**kwargs)
+        return result_df
+    except Exception as e:  
+        print(f"cant run {model_name} model: ", e)
+
+
+
+# %% RT run
+
+## db connect
+db_connection = create_engine(f'mysql+pymysql://{user}:{passwd}@{host}/{db}')
+conn = db_connection.connect()
+path = path.replace('\\', '/')+'/'
+save_path = save_path.replace('\\', '/')+'/'
+
+# kmi_update check(RT)
+kmi_update = pd.read_sql_query(f"SELECT year, month, \
+                                       CASE WHEN month < 10 then CONCAT(YEAR, '0', MONTH) \
+                                           WHEN month > 9 then CONCAT(YEAR, MONTH) END AS kmi_update \
+                                FROM {rt_load_tb} ORDER BY YEAR DESC limit 1;",  db_connection)
+model_idx = pd.read_sql_query(f"SELECT model_idx FROM {rt_pred_tb} ORDER BY MODEL_IDX DESC LIMIT 1 ;", db_connection)
+kmi_update = int(kmi_update['kmi_update'])
+if len(model_idx) == 0:
+    model_idx = 0
+else:
+    model_idx = int(model_idx['model_idx'])
+
+if kmi_update > model_idx:
+   print(f'--- kmiDB updated:: start model_idx({kmi_update}) ---')
+   kmi_update = str(kmi_update)
+   total_now = datetime.datetime.now()
+   # run
+   item_list = ['coal', 'cement'] #['metal', 'coal', 'cement', 'oil', 'etc', 'car'] #, 'container'
+   target_list = ['수입', '수출', '연안', '환적']
+    
+   # 예측 data 및 항만 비중 데이터 불러오기
+   percen_df0 = pd.read_sql_query("SELECT * FROM HARBOR_PERCENT ;", db_connection)
+   percen_df0['USE_YEAR'] = percen_df0['BASE_YEAR'] + percen_df0['YEAR_RANGE']
+   percen_df = percen_df0[percen_df0['USE_YEAR'] == int(kmi_update[:4])].reset_index(drop=True) #임시
+
+    
+   for item_name in item_list:
+       if item_name == 'container': # 컨테이너
+           ori = pd.read_sql_query(f"SELECT * FROM {con_load_tb} where YEAR > 1999 ;", db_connection)
+           kmi_con, kmi_con_kr = kmi_df_update(ori)            
+       else: # 비컨테이너
+           ori = pd.read_sql_query(f"SELECT * FROM {rt_load_tb} where YEAR > 1999 ;", db_connection)
+           kmi_df, kmi_df_kr = kmi_df_update(ori)        
+            
+       for target_name in target_list:
+           now = datetime.datetime.now()
+           ################################### 고철 수입 ###########################################
+           if item_name == 'metal' and target_name == '수입':
+               print('start: ', item_name, target_name, kmi_update)
+               item_name_kr = item_name_change(item_name)
+               target_name_eng = target_name_change(item_name=item_name, target_name=target_name)
+               fix_train_end, fix_test_end, fix_test_end_l = fix_end_date(kmi_update=kmi_update,
+                                                                          base_train_end='2022-10',
+                                                                          base_test_end='2025-12')
+               ################################### 공통 ###########################################
+               ### 입력받는 정보
+               date_name = 'ym'
+               train_start_date, train_end_date = '2001-01', fix_train_end
+               short_model, long_model = 'ridge', 'ridge'
+               if short_model == long_model:
+                   short_pred_year = 28
+                   # long_pred_year = np.nan
+               else:
+                   short_pred_year = 4
+                   long_pred_year = 25
+               # test start date 생성
+               test_start_date = str(np.datetime64(train_end_date) + np.timedelta64(1, 'M'))
+               # test end date 생성
+               test_end_date = str(np.datetime64(test_start_date) + np.timedelta64(short_pred_year, 'Y'))
+               if int(test_end_date[-2:]) < 12:
+                    test_end_date = test_end_date[:4] + '-12'
+               else: pass
+                
+               ### 모델 학습
+               data = pd.read_csv(f'{path}MART_METAL_IMP_KR.csv', encoding='euc-kr')
+                
+               kmi_df_kr2 = kmi_df_kr[(kmi_df_kr['ITEM_TYPE'] == item_name_kr) & (kmi_df_kr['IMPORT_EXPORT'] == target_name)]
+               kmi_df_kr2 = kmi_df_kr2[['ym', 'NON_CONTAINER']]
+               data = datamart_datetype(data, 'ym')
+               data2 = data.merge(kmi_df_kr2, how='left', on='ym')
+               # 물동량 결측값 예측값으로 대체 및 df 생성
+               data2.loc[(np.isnan(data2['NON_CONTAINER']) & (data2['ym'] <= kmi_update[0:4] + '-' + kmi_update[-2:])), 'NON_CONTAINER'] = 0
+               data2.loc[np.isnan(data2['NON_CONTAINER']), 'NON_CONTAINER'] = data2[target_name]
+               data2 = data2.drop(columns=[target_name, 'lag3' ,'lag6', 'lag9', 'lag11', 'lag12'])
+               data2 = data2.rename(columns={'NON_CONTAINER': target_name})
+               target_lag_list = [3, 6, 9, 11, 12]
+               for target_lag in target_lag_list:
+                    data2['lag' + str(target_lag)] = data2[target_name].shift(target_lag)
+               ################################### 개별 전처리 ###########################################
+               scaler = MinMaxScaler()
+               anal_df = data2.copy()
+               scal_col = list(anal_df.drop(columns=['ym', '항만명', '품목', target_name]))
+               scaler.fit(anal_df[scal_col])
+               anal_df[scal_col] = scaler.transform(anal_df[scal_col])
+               
+               scaler_y = MinMaxScaler()
+               scaler_y.fit(anal_df[[target_name]])
+               anal_df[target_name] = scaler_y.transform(anal_df[[target_name]])
+               ################################### 공통 ###########################################
+               pred_df_s = model_running(short_model, model_data=anal_df.copy(), item_name=item_name, target_name=target_name,
+                                          date_name=date_name, train_start_date=train_start_date,
+                                          train_end_date=train_end_date,
+                                          test_start_date=test_start_date, test_end_date=test_end_date)
+               ################################### 개별 전처리 ###########################################
+               pred_df_s['predict'] = scaler_y.inverse_transform(pred_df_s[['predict']])
+               if short_model == long_model:
+                   pred_df = pred_df_s.copy()
+               else: print(f'### {item_name} {target_name} 오류 ###')
+           ################################### 고철 수출 ###########################################
+           elif item_name == 'metal' and target_name == '수출':
+               print('start: ', item_name, target_name, kmi_update)
+               item_name_kr = item_name_change(item_name)
+               target_name_eng = target_name_change(item_name=item_name, target_name=target_name)
+               fix_train_end, fix_test_end, fix_test_end_l = fix_end_date(kmi_update=kmi_update,
+                                                                           base_train_end='2022-10',
+                                                                           base_test_end='2025-12')
+               ################################### 공통 ###########################################
+               ### 입력받는 정보
+               date_name = 'ym'
+               train_start_date, train_end_date = '2006-01', fix_train_end
+               short_model, long_model = 'xgboost', 'arima'
+               if short_model == long_model:
+                   short_pred_year = 30
+                   # long_pred_year = np.nan
+               else:
+                   short_pred_year = 3
+                   long_pred_year = 25
+               # test start date 생성
+               test_start_date = str(np.datetime64(train_end_date) + np.timedelta64(1, 'M'))
+               # test end date 생성
+               test_end_date = str(np.datetime64(test_start_date) + np.timedelta64(short_pred_year, 'Y'))
+               if int(test_end_date[-2:]) < 12:
+                   test_end_date = test_end_date[:4] + '-12'
+               else: pass
+               ### 모델 학습
+               # origin smoothing set
+               data = pd.read_csv(f'{path}MART_METAL_EXP_KR.csv', encoding='euc-kr')
+               data_smooth_origin = data.copy()
+               data_smooth_origin = datamart_datetype(data_smooth_origin, 'ym')
+               data_smooth_origin = data_smooth_origin[data_smooth_origin['ym'] <= train_end_date]
+               # new smoothing set 생성
+               data = pd.read_csv(f'{path}MART_METAL_EXP_KR.csv', encoding='euc-kr')
+               kmi_df_kr2 = kmi_df_kr[(kmi_df_kr['ITEM_TYPE'] == item_name_kr) & (kmi_df_kr['IMPORT_EXPORT'] == target_name)]
+               kmi_df_kr2 = kmi_df_kr2[['ym', 'NON_CONTAINER']]
+               data = datamart_datetype(data, 'ym')
+               data2 = data.merge(kmi_df_kr2, how='left', on='ym')
+               # 물동량 결측값 예측값으로 대체 및 df 생성
+               data2.loc[(np.isnan(data2['NON_CONTAINER']) & (
+                   data2['ym'] <= kmi_update[0:4] + '-' + kmi_update[-2:])), 'NON_CONTAINER'] = 0
+               data2.loc[np.isnan(data2['NON_CONTAINER']), 'NON_CONTAINER'] = data2[target_name]
+               data2 = data2.drop(columns=[target_name, 'lag3', 'lag6', 'lag9', 'lag11', 'lag12'])
+               data2 = data2.rename(columns={'NON_CONTAINER': target_name})
+               # 2000.01~2005.12 (스무딩 미적용)
+               data_origin = data2[data2['ym'] < train_start_date]
+               # 2006.01~2025.12(스무딩 적용)
+               data3 = data2[(data2['ym'] >= train_start_date) & (data2['ym'] <= test_end_date)]
+               y = data3[target_name]
+               y_smooth = signal.savgol_filter(y, window_length=53, polyorder=3)
+               data3['smooth_pred'] = y_smooth
+               data3.loc[data3['smooth_pred'] < 0, 'smooth_pred'] = 0
+               anal_df = data3.copy()
+               anal_df = anal_df[anal_df['ym'] >= train_start_date]
+               anal_df = anal_df.drop(columns=[target_name])
+               anal_df = anal_df.rename(columns={'smooth_pred': target_name})
+               anal_df2 = pd.concat([data_origin, anal_df])
+               # 2026.01~2050.12(단변량 베이스모델-스무딩 미적용)
+               data_single_pred = data2[(data2['ym'] > test_end_date) & (data2['ym'] <= fix_test_end_l)]
+               anal_df3 = pd.concat([anal_df2, data_single_pred])
+               target_lag_list = [3, 6, 9, 11, 12]
+               for target_lag in target_lag_list:
+                   anal_df3['lag' + str(target_lag)] = anal_df3[target_name].shift(target_lag)
+               # origin smoothing set(2022.10) + new smoothing set(2022.11~)
+               new_smooth_set = anal_df3[anal_df3['ym']>=test_start_date]
+               smooth_df = pd.concat([data_smooth_origin, new_smooth_set], axis=0)
+               ### 모델 학습
+               anal_df = smooth_df.copy()
+               pred_df_s = model_running(short_model, model_data=anal_df, item_name=item_name, target_name=target_name,
+                                          date_name=date_name, train_start_date=train_start_date,
+                                          train_end_date=train_end_date,
+                                          test_start_date=test_start_date, test_end_date=test_end_date)
+               if short_model == long_model:
+                pred_df = pred_df_s.copy()
+               else:
+                   ################################### 개별 전처리 ###########################################
+                   pred_df_s = pred_df_s[pred_df_s['ym'] <= test_end_date]
+                   # 스무딩 적용된 기존 물동량 사용
+                   data_origin = anal_df[anal_df['ym'] <= kmi_update[0:4] + '-' + kmi_update[-2:]]
+                   # 실제값 이후 물동량 단기 예측 값으로 대체
+                   data3 = anal_df[(anal_df['ym'] > kmi_update[0:4] + '-' + kmi_update[-2:]) & (anal_df['ym'] <= fix_test_end_l)]
+                   pred_df_s = pred_df_s[['ym', 'predict']]
+                   try:
+                       data3['ym'] = data3['ym'].astype('str')
+                       pred_df_s['ym'] = pred_df_s['ym'].astype('str')
+                   except: pass
+                   data4 = data3.merge(pred_df_s, how='left', on='ym')
+                   data4[target_name] = data4['predict']
+                   data4 = data4.drop(columns=['predict'])
+                   # 실제 물동량 데이터와 단기 예측 데이터 병합
+                   final_df = pd.concat([data_origin, data4], axis=0)
+                   ################################### 공통 ###########################################
+                   # 장기 모델 학습
+                   train_end_date = fix_test_end
+                   pred_year = 25
+                   pred_df_l = model_running(long_model, model_data=final_df, item_name=item_name,
+                                              target_name=target_name,
+                                              date_name=date_name, train_start_date=train_start_date,
+                                              train_end_date=train_end_date, pred_year=pred_year)
+                   pred_df = pd.concat([pred_df_s, pred_df_l], axis=0)
+           ################################### 고철 연안 ###########################################
+           elif item_name == 'metal' and target_name == '연안':
+                print('start: ', item_name, target_name, kmi_update)
+                item_name_kr = item_name_change(item_name)
+                target_name_eng = target_name_change(item_name=item_name, target_name=target_name)
+                fix_train_end, fix_test_end, fix_test_end_l = fix_end_date(kmi_update=kmi_update,
+                                                                           base_train_end='2022-10',
+                                                                           base_test_end='2025-12')
+                ### 입력받는 정보
+                date_name = 'ym'
+                train_start_date, train_end_date = '2001-01', fix_train_end
+                short_model, long_model = 'xgboost', 'xgboost'
+                if short_model == long_model:
+                    short_pred_year = 28
+                else:
+                    short_pred_year = 4
+                    long_pred_year = 25
+                # test start date 생성
+                test_start_date = str(np.datetime64(train_end_date) + np.timedelta64(1, 'M'))
+                # test end date 생성
+                test_end_date = str(np.datetime64(test_start_date) + np.timedelta64(short_pred_year, 'Y'))
+                if int(test_end_date[-2:]) < 12:
+                    test_end_date = test_end_date[:4] + '-12'
+                else:
+                    pass
+                ### 모델 학습
+                data = pd.read_csv(f'{path}MART_METAL_CST_KR.csv', encoding='euc-kr')
+                kmi_df_kr2 = kmi_df_kr[
+                    (kmi_df_kr['ITEM_TYPE'] == item_name_kr) & (kmi_df_kr['IMPORT_EXPORT'] == target_name)]
+                kmi_df_kr2 = kmi_df_kr2[['ym', 'NON_CONTAINER']]
+                data = datamart_datetype(data, 'ym')
+                data2 = data.merge(kmi_df_kr2, how='left', on='ym')
+                # 물동량 결측값 예측값으로 대체 및 df 생성
+                data2.loc[(np.isnan(data2['NON_CONTAINER']) & (
+                            data2['ym'] <= kmi_update[0:4] + '-' + kmi_update[-2:])), 'NON_CONTAINER'] = 0
+                data2.loc[np.isnan(data2['NON_CONTAINER']), 'NON_CONTAINER'] = data2[target_name]
+                data2 = data2.drop(columns=[target_name])
+                data2 = data2.rename(columns={'NON_CONTAINER': target_name})
+                scaler = MinMaxScaler()
+                anal_df = data2.copy()
+                scal_col = list(anal_df.drop(columns=['ym', '항만명', '품목', target_name]))
+                scaler.fit(anal_df[scal_col])
+                anal_df[scal_col] = scaler.transform(anal_df[scal_col])
+                ################################### 공통 ###########################################
+                pred_df_s = model_running(short_model, model_data=anal_df, item_name=item_name, target_name=target_name,
+                                          date_name=date_name, train_start_date=train_start_date,
+                                          train_end_date=train_end_date,
+                                          test_start_date=test_start_date, test_end_date=test_end_date)
+                if short_model == long_model:
+                    pred_df = pred_df_s.copy()
+                else:
+                    print(f'### {item_name} {target_name} 오류 ###')
+           ################################### 석탄 수입 ###########################################
+           elif item_name == 'coal' and target_name == '수입':
+                print('start: ', item_name, target_name, kmi_update)
+                item_name_kr = item_name_change(item_name)
+                target_name_eng = target_name_change(item_name=item_name, target_name=target_name)
+                fix_train_end, fix_test_end, fix_test_end_l = fix_end_date(kmi_update=kmi_update,
+                                                                           base_train_end='2018-12',
+                                                                           base_test_end='2025-12')
+                ### 입력받는 정보
+                date_name = 'ym'
+                train_start_date, train_end_date = '2001-01', fix_train_end
+                short_model, long_model = 'xgboost', 'avg_prophet_arima'
+                if short_model == long_model:
+                    short_pred_year = 28
+                else:
+                    short_pred_year = 6
+                    long_pred_year = 25
+                # test start date 생성
+                test_start_date = str(np.datetime64(train_end_date) + np.timedelta64(1, 'M'))
+                # test end date 생성
+                test_end_date = str(np.datetime64(test_start_date) + np.timedelta64(short_pred_year, 'Y'))
+                if int(test_end_date[-2:]) < 12:
+                    test_end_date = test_end_date[:4] + '-12'
+                else:
+                    pass
+                ### 모델 학습
+                data = pd.read_csv(f'{path}MART_COAL_IMP_KR.csv', encoding='euc-kr')
+                kmi_df_kr2 = kmi_df_kr[(kmi_df_kr['ITEM_TYPE'] == item_name_kr) & (kmi_df_kr['IMPORT_EXPORT'] == target_name)]
+                kmi_df_kr2 = kmi_df_kr2[['ym', 'NON_CONTAINER']]
+                data = datamart_datetype(data, 'ym')
+                data2 = data.merge(kmi_df_kr2, how='left', on='ym')
+                # 물동량 결측값 예측값으로 대체 및 df 생성
+                data2.loc[(np.isnan(data2['NON_CONTAINER']) & (
+                            data2['ym'] <= kmi_update[0:4] + '-' + kmi_update[-2:])), 'NON_CONTAINER'] = 0
+                data2.loc[np.isnan(data2['NON_CONTAINER']), 'NON_CONTAINER'] = data2[target_name]
+                data2 = data2.drop(columns=[target_name, 'lag3' ,'lag6', 'lag9', 'lag11', 'lag12'])
+                data2 = data2.rename(columns={'NON_CONTAINER': target_name})
+                target_lag_list = [3, 6, 9, 11, 12]
+                for target_lag in target_lag_list:
+                    data2['lag' + str(target_lag)] = data2[target_name].shift(target_lag)
+                scaler = MinMaxScaler()
+                anal_df = data2.copy()
+                anal_df = anal_df[(anal_df['ym'] >= train_start_date) & (anal_df['ym'] <= test_end_date)]
+                scal_col = list(anal_df.drop(columns=['ym', '항만명', '품목', target_name]))
+                scaler.fit(anal_df[scal_col])
+                anal_df[scal_col] = scaler.transform(anal_df[scal_col])
+                scaler_y = MinMaxScaler()
+                scaler_y.fit(anal_df[[target_name]])
+                anal_df[target_name] = scaler_y.transform(anal_df[[target_name]])
+                pred_df_s = model_running(short_model, model_data=anal_df, item_name=item_name, target_name=target_name,
+                                          date_name=date_name, train_start_date=train_start_date,
+                                          train_end_date=train_end_date,
+                                          test_start_date=test_start_date, test_end_date=test_end_date)
+                pred_df_s['predict'] = scaler_y.inverse_transform(pred_df_s[['predict']])
+                if short_model == long_model:
+                    pred_df = pred_df_s.copy()
+                else:
+                    pred_df_s = pred_df_s[pred_df_s['ym'] <= test_end_date]
+                    # 기존 물동량 사용
+                    data_origin = data2[data2['ym'] <= kmi_update[0:4] + '-' + kmi_update[-2:]]
+                    # 실제값 이후 물동량 단기 예측 값으로 대체
+                    data3 = data2[(data2['ym'] > kmi_update[0:4] + '-' + kmi_update[-2:]) & (data2['ym'] <= fix_test_end_l)]
+                    pred_df_s = pred_df_s[['ym', 'predict']]
+                    try:
+                        data3['ym'] = data3['ym'].astype('str')
+                        pred_df_s['ym'] = pred_df_s['ym'].astype('str')
+                    except: pass
+                    data4 = data3.merge(pred_df_s, how='left', on='ym')
+                    data4[target_name] = data4['predict']
+                    data4 = data4.drop(columns=['predict'])
+                    # 실제 물동량 데이터와 단기 예측 데이터 병합
+                    final_df = pd.concat([data_origin, data4], axis=0)
+                    # 장기
+                    train_start_date = '2000-01'
+                    train_end_date = fix_test_end
+                    pred_year = 25
+                    # arima
+                    long_model_nm = 'arima'
+                    pred_df_l = model_running(long_model_nm, model_data=final_df, item_name=item_name,
+                                              target_name=target_name,
+                                              date_name=date_name, train_start_date=train_start_date,
+                                              train_end_date=train_end_date, pred_year=pred_year)
+                    pred_df_l = pred_df_l.rename(columns={'predict': 'predict_1'})
+                    # prophet
+                    long_model_nm = 'prophet'
+                    pred_df_l2 = model_running(long_model_nm, model_data=final_df, item_name=item_name,
+                                              target_name=target_name,
+                                              date_name=date_name, train_start_date=train_start_date,
+                                              train_end_date=train_end_date, pred_year=pred_year)
+                    pred_df_l2 = pred_df_l2.rename(columns={'predict': 'predict_2'})
+                    # avg
+                    pred_tot = pred_df_l.merge(pred_df_l2, how='left', on='ym')
+                    pred_tot['predict'] = pred_tot.loc[:, ['predict_1', 'predict_2']].mean(axis=1)  # 평균 구함
+                    pred_tot = pred_tot.drop(columns=['predict_1', 'predict_2'])
+                    # table 형식 변환 함수 실행
+                    pred_df = pd.concat([pred_df_s, pred_tot], axis=0)
+           ################################### 석탄 연안 ###########################################
+           elif item_name == 'coal' and target_name == '연안':
+                print('start: ', item_name, target_name, kmi_update)
+                item_name_kr = item_name_change(item_name)
+                target_name_eng = target_name_change(item_name=item_name, target_name=target_name)
+                fix_train_end, fix_test_end, fix_test_end_l = fix_end_date(kmi_update=kmi_update,
+                                                                           base_train_end='2022-10',
+                                                                           base_test_end='2025-12')
+                ### 입력받는 정보
+                harbor_kr_tot = pd.DataFrame()
+                date_name = 'ym'
+                pt_list = ['광양', '군산', '보령']
+                for pt in pt_list:
+                    print('start: ', item_name, target_name, kmi_update, pt)
+                    kmi_df2 = kmi_df[
+                        (kmi_df['ITEM_TYPE'] == item_name_kr) & (kmi_df['IMPORT_EXPORT'] == target_name) & (kmi_df['HARBOR']==pt)]
+                    kmi_df2 = kmi_df2.groupby(['ym', 'HARBOR', 'ITEM_TYPE', 'IMPORT_EXPORT'])['NON_CONTAINER'].sum().reset_index()
+                    kmi_df2 = kmi_df2[['ym', 'NON_CONTAINER']]
+                    data = pd.read_csv(f'{path}MART_COAL_CST_HARBOR.csv', encoding='euc-kr')
+                    data = data[data['항만명'] == pt]
+                    data = datamart_datetype(data, 'ym')
+                    data2 = data.merge(kmi_df2, how='left', on='ym')
+                    # 물동량 결측값 예측값으로 대체 및 df 생성
+                    data2.loc[(np.isnan(data2['NON_CONTAINER']) & (data2['ym']<=kmi_update[0:4] + '-' + kmi_update[-2:])), 'NON_CONTAINER'] = 0
+                    data2.loc[np.isnan(data2['NON_CONTAINER']), 'NON_CONTAINER'] = data2[target_name]
+                    data2 = data2.drop(columns=[target_name, 'lag1', 'lag2', 'lag3'])
+                    data2 = data2.rename(columns={'NON_CONTAINER': target_name})
+                    target_lag_list = [1, 2, 3]
+                    for target_lag in target_lag_list:
+                        data2['lag' + str(target_lag)] = data2[target_name].shift(target_lag)
+                    train_end_date = fix_train_end
+                    pred_year = 3
+                    if pt == '보령':
+                        train_start_date = '2021-04'
+                    else:
+                        train_start_date = '2018-10'
+                    # test start date 생성
+                    test_start_date = str(np.datetime64(train_end_date) + np.timedelta64(1, 'M'))
+                    # test end date 생성
+                    test_end_date = str(np.datetime64(test_start_date) + np.timedelta64(pred_year, 'Y'))
+                    if int(test_end_date[-2:]) < 12:
+                        test_end_date = test_end_date[:4] + '-12'
+                    else: pass
+                    scaler = MinMaxScaler()
+                    anal_df = data2.copy()
+                    scal_col = list(anal_df.drop(columns=['ym', '항만명', '품목', target_name]))
+                    scaler.fit(anal_df[scal_col])
+                    anal_df[scal_col] = scaler.transform(anal_df[scal_col])
+                    scaler_y = MinMaxScaler()
+                    scaler_y.fit(anal_df[[target_name]])
+                    anal_df[target_name] = scaler_y.transform(anal_df[[target_name]])
+                    if pt == '광양':
+                        short_model = 'xgboost'
+                    else:
+                        short_model = 'ridge'
+                    pred_df_s = model_running(short_model, model_data=anal_df, item_name=item_name, target_name=target_name,
+                                              date_name=date_name, train_start_date=train_start_date,
+                                              train_end_date=train_end_date,
+                                              test_start_date=test_start_date, test_end_date=test_end_date)
+                    pred_df_s['predict'] = scaler_y.inverse_transform(pred_df_s[['predict']])
+                    # 2022.10 기존 물동량 사용
+                    data2 = data.copy()
+                    data2 = data2[data2['항만명'] == pt]
+                    data_origin = data2[data2['ym'] < test_start_date]
+                    # 2022.11~ 단기 예측 값으로 대체
+                    data3 = data2[(data2['ym'] >= test_start_date) & (data2['ym'] < test_end_date)]
+                    pred_df_s = pred_df_s[['ym', 'predict']]
+                    try:
+                        data3['ym'] = data3['ym'].astype('str')
+                        pred_df_s['ym'] = pred_df_s['ym'].astype('str')
+                    except: pass
+                    data4 = data3.merge(pred_df_s, how='left', on='ym')
+                    data4[target_name] = data4['predict']
+                    data4 = data4.drop(columns=['predict'])
+                    # 2022.10 이전 데이터와 2022.11 이후 데이터 병합
+                    final_df = pd.concat([data_origin, data4], axis=0)
+                    # 장기
+                    train_end_date = fix_test_end
+                    pred_year = 25
+                    if pt == '보령':
+                        long_model = 'arima'
+                    else:
+                        long_model = 'xgboostts'
+                    pred_df_l = model_running(long_model, model_data=final_df, item_name=item_name,
+                                              target_name=target_name,
+                                              date_name=date_name, train_start_date=train_start_date,
+                                              train_end_date=train_end_date, pred_year=pred_year)
+                    pred_df_s = datamart_datetype(pred_df_s, 'ym')
+                    pred_df_s = pred_df_s[pred_df_s['ym'] <= train_end_date]
+                    pred_df = pd.concat([pred_df_s, pred_df_l], axis=0)
+                
+                    # update 물동량 이후 예측값만 저장
+                    pred_df2 = pred_df[pred_df['ym'] > kmi_update[0:4] + '-' + kmi_update[-2:]]
+                
+                    hb_data = forecast_csv_bottomup_hb(pred_df2, pt, '전체', item_name_kr, target_name, 'predict',
+                                                       short_model, fix_test_end, long_model, fix_test_end_l, kmi_update)
+                    # 항만별 data 저장
+                    #db write
+                    hb_data.to_sql(name=rt_pred_tb, con=db_connection, if_exists='append', index=False)  
+                    harbor_kr_tot = pd.concat([harbor_kr_tot, hb_data], axis=0)
+                    # 모델 학습 시간 저장
+                    runtime = datetime.datetime.now() - now
+                    runtime = runtime.total_seconds() / 60
+                    runtime_df = pd.DataFrame({'item_name': [item_name_kr],
+                                               'target_name': [target_name],
+                                               'harbor_name': [pt],
+                                               'model_index': [kmi_update],
+                                               'runtime(minutes)': [runtime]})
+                    if not os.path.exists(f'{save_path}runtime.csv'):
+                        runtime_df.to_csv(f'{save_path}runtime.csv', index=False, mode='w',
+                                          encoding='euc-kr')
+                    else:
+                        runtime_df.to_csv(f'{save_path}runtime.csv', index=False, mode='a',
+                                          encoding='euc-kr', header=False)
+                    print('end: ', item_name, target_name, kmi_update, pt)
+                    
+                kr_tot = forecast_csv_bottomup_kr(harbor_kr_tot, '전체', item_name_kr, target_name, 'predict', short_model,
+                                                  fix_test_end, long_model, fix_test_end_l, kmi_update)
+                #db write
+                kr_tot.to_sql(name=rt_pred_tb, con=db_connection, if_exists='append', index=False)  
+          
+           ################################### 컨테이너 수입 ########################################
+
+           elif item_name == 'container' and target_name == '수입':
+                print('start: ', item_name, target_name, kmi_update)
+                con_target_name = '적_수입'
+                item_name_kr = item_name_change(item_name)
+                target_name_eng = target_name_change(item_name=item_name, target_name=con_target_name)
+                fix_train_end, fix_test_end, fix_test_end_l = fix_end_date(kmi_update=kmi_update,
+                                                                           base_train_end='2021-01',
+                                                                           base_test_end='2025-12')
+                ### 입력받는 정보
+                date_name = 'ym'
+                ar_date_name = 'year'
+                train_start_date, train_end_date = '2000-01', fix_train_end
+                short_model, long_model = 'arima', 'ridge'
+                if short_model == long_model:
+                    short_pred_year = 30
+                else:
+                    short_pred_year = 5
+                    long_pred_year = 25
+                # 컨테이너
+                item_name_u, target_name_u = item_name_kr, target_name
+                data = pd.read_csv(f'{path}MART_CONTAINER_IMP_KR.csv', encoding='euc-kr')
+                update = kmi_con_kr[
+                    (kmi_con_kr['ITEM_TYPE'] == item_name_u) & (kmi_con_kr['IMPORT_EXPORT'] == target_name_u)][
+                    ['ym', 'TEU_FILL']]
+                data['ym'] = pd.to_datetime(data['ym'])
+                merged = data.merge(update, how='left', on='ym')
+                merged['TEU_FILL'].fillna(merged[con_target_name], inplace=True)
+                data = merged.drop(con_target_name, axis=1)
+                data.rename(columns={'TEU_FILL': con_target_name}, inplace=True) #'TEU_FILL': con_target_name
+                y_lags = [6, 9, 11, 12]
+                for y_lag in y_lags:
+                    data[f'lag_{y_lag}'] = data[con_target_name].shift(y_lag)
+                new_data_end_date = datetime.datetime.strptime(kmi_update[:4] + '-' + kmi_update[4:6],
+                                                               "%Y-%m").strftime('%Y-%m')
+                test_start_date_s, test_end_date_s = '2022-11', fix_test_end
+                ### 모델 학습
+                anal_df = data.copy()
+                anal_df['ym'] = pd.to_datetime(anal_df['ym'])
+                anal_df['year'] = anal_df['ym'].dt.year
+                anal_df = anal_df.groupby(['year', '항만명'], as_index=False).sum()[['year', '항만명', con_target_name]]
+                # ar_data_y = ar_data_y[ar_data_y['year'] < 2022]
+                anal_df['year'] = pd.to_datetime(anal_df['year'], format='%Y')
+                pred_df_s = model_running(short_model, model_data=anal_df, item_name=item_name, target_name=con_target_name,
+                                          date_name=ar_date_name, train_start_date=train_start_date,
+                                          train_end_date=train_end_date, pred_year=short_pred_year
+                                          )
+                pred_df_s['predict'] = pred_df_s['predict'] / 12
+                pred_df_s = pred_df_s.resample('MS', on='year').apply(np.sum).reset_index() 
+                pred_df_s.replace(0, np.nan, inplace=True)
+                pred_df_s['predict'] = pred_df_s['predict'].interpolate()
+                pred_df_s.rename(columns={'year': 'ym'}, inplace=True)
+                if short_model == long_model:
+                    pred_df = pred_df_s.copy()
+                else:
+                    pred_df_s = pred_df_s[
+                        (pred_df_s['ym'] >= test_start_date_s) & (pred_df_s['ym'] <= test_end_date_s)]  # 단기 결과
+                    try:
+                        data['ym'] = data['ym'].astype('str')
+                        pred_df_s['ym'] = pred_df_s['ym'].astype('str')
+                    except: pass
+                    data2 = data.merge(pred_df_s, how='left', on='ym')
+                    data2['predict'].fillna(data2[con_target_name], inplace=True)
+                    data2.drop(con_target_name, axis=1, inplace=True)
+                    data2.rename(columns={'predict': con_target_name}, inplace=True)
+                    # 2022.10 이전 데이터와 2022.11 이후 데이터 병합
+                    final_df = data2
+                    y_lags = [6, 9, 11, 12]
+                    for y_lag in y_lags:
+                        final_df[f'lag_{y_lag}'] = final_df[con_target_name].shift(y_lag)
+                    ################################### 공통 ###########################################
+                    # 장기 모델 학습
+                    train_start_date, train_end_date = '2001-01', fix_test_end
+                    # test start date 생성
+                    test_start_date_l = str(np.datetime64(train_end_date) + np.timedelta64(1, 'M'))
+                    # test end date 생성
+                    test_end_date_l = str(
+                        np.datetime64(test_start_date_l) + np.timedelta64(long_pred_year, 'Y') - np.timedelta64(1, 'M'))
+                    #pred_year = 25
+                    pred_df_l = model_running(long_model, model_data=final_df, item_name=item_name,
+                                              target_name=con_target_name,
+                                              date_name=date_name, train_start_date=train_start_date,
+                                              train_end_date=train_end_date, test_start_date=test_start_date_l,
+                                              test_end_date=test_end_date_l)
+                    pred_df = pd.concat([pred_df_s, pred_df_l], axis=0)
+           ################################### 컨테이너 수출 ########################################
+           elif item_name == 'container' and target_name == '수출':
+                print('start: ', item_name, target_name, kmi_update)
+                con_target_name = '적_수출'
+                item_name_kr = item_name_change(item_name)
+                target_name_eng = target_name_change(item_name=item_name, target_name=con_target_name)
+                fix_train_end, fix_test_end, fix_test_end_l = fix_end_date(kmi_update=kmi_update,
+                                                                           base_train_end='2019-12',
+                                                                           base_test_end='2025-12')
+                ### 입력받는 정보
+                date_name = 'ym'
+                train_start_date_s, train_end_date_s = '2006-01', fix_train_end
+                short_model, long_model = 'ridge', 'arima'
+                if short_model == long_model:
+                    short_pred_year = 30
+                else:
+                    short_pred_year = 8
+                    long_pred_year = 25
+                item_name_u, target_name_u = item_name_kr, target_name
+                data = pd.read_csv(f'{path}MART_CONTAINER_EXP_KR.csv', encoding='euc-kr')
+                update = \
+                    kmi_con_kr[
+                        (kmi_con_kr['ITEM_TYPE'] == item_name_u) & (kmi_con_kr['IMPORT_EXPORT'] == target_name_u) &
+                        (kmi_con_kr['ym'] > train_end_date_s)][['ym', 'TEU_FILL']]
+                data['ym'] = pd.to_datetime(data['ym'])
+                merged = data.merge(update, how='left', on='ym')
+                merged['TEU_FILL'].fillna(merged[con_target_name], inplace=True)
+                data = merged.drop(con_target_name, axis=1)
+                data.rename(columns={'TEU_FILL': con_target_name}, inplace=True)
+                new_data_end_date = datetime.datetime.strptime(kmi_update[:4] + '-' + kmi_update[4:6],
+                                                               "%Y-%m").strftime('%Y-%m')
+                # test start date 생성
+                test_start_date = str(np.datetime64(train_end_date_s) + np.timedelta64(1, 'M'))
+                # test end date 생성
+                test_end_date = str(np.datetime64(test_start_date) + np.timedelta64(short_pred_year, 'Y'))
+                ### 모델 학습
+                anal_df = data.copy()
+                pred_df_s = model_running(short_model, model_data=anal_df, item_name=item_name,
+                                          target_name=con_target_name,
+                                          date_name=date_name, train_start_date=train_start_date_s,
+                                          train_end_date=train_end_date_s,
+                                          test_start_date=test_start_date, test_end_date=test_end_date)
+                if short_model == long_model:
+                    pred_df = pred_df_s.copy()
+                else:
+                    pred_df_s['ym'] = pd.to_datetime(pred_df_s['ym'])
+                    pred_df_s = pred_df_s[pred_df_s['ym'] <= fix_test_end]  # 단기 결과
+                    # 2022.10까지 스무딩 적용된 물동량 사용
+                    data_origin = data[(data['ym'] >= train_start_date_s) & (data['ym'] < test_start_date)][
+                        ['ym', con_target_name]]
+                    data_origin.rename(columns={con_target_name: 'predict'}, inplace=True)
+                    merged = pd.concat([data_origin, pred_df_s]).reset_index(drop=True)
+                    window_length, polyorder = 27, 2
+                    data_s = merged.copy()
+                    target_name_sv = 'predict'
+                    yhat = savgol_filter(data_s[target_name_sv], window_length, polyorder, mode='nearest')
+                    merged[target_name_sv] = yhat
+                    merged[date_name] = pd.to_datetime(merged[date_name])
+                    pred_df_s_sv = merged[(merged['ym'] >= test_start_date) & (merged['ym'] < test_end_date)]
+                    data[date_name] = pd.to_datetime(data[date_name])
+                    final_df = data.merge(merged, how='left', on='ym').dropna()
+                    final_df[con_target_name] = final_df[target_name_sv]
+                    ################################### 공통 ###########################################
+                    # 장기 모델 학습
+                    train_start_date_l = train_start_date_s
+                    train_end_date_l = fix_test_end
+                    pred_year = 25
+                    pred_df_l = model_running(long_model, model_data=final_df, item_name=item_name,
+                                              target_name=con_target_name,
+                                              date_name=date_name, train_start_date=train_start_date_l,
+                                              train_end_date=train_end_date_l, pred_year=pred_year)
+                    pred_df = pd.concat([pred_df_s_sv, pred_df_l], axis=0)
+                    pred_df['ym'] = pd.to_datetime(pred_df['ym'])
+           ################################### 컨테이너 연안 ########################################
+           elif item_name == 'container' and target_name == '연안':
+                print('start: ', item_name, target_name, kmi_update)
+                con_target_name = '적_연안'
+                item_name_kr = item_name_change(item_name)
+                target_name_eng = target_name_change(item_name=item_name, target_name=con_target_name)
+                fix_train_end, fix_test_end, fix_test_end_l = fix_end_date(kmi_update=kmi_update,
+                                                                           base_train_end='2022-10',
+                                                                           base_test_end='2025-12')
+                ### 입력받는 정보
+                date_name = 'ym'
+                train_start_date_s, train_end_date_s = '2009-01', fix_train_end
+                short_model, long_model = 'ridge', 'ridge'
+                if short_model == long_model:
+                    short_pred_year = 30
+                    # long_pred_year = np.nan
+                else:
+                    short_pred_year = 4
+                    long_pred_year = 25
+                item_name_u, target_name_u = item_name_kr, target_name
+                data = pd.read_csv(f'{path}MART_CONTAINER_CST_KR.csv', encoding='euc-kr')
+                update = \
+                kmi_con_kr[(kmi_con_kr['ITEM_TYPE'] == item_name_u) & (kmi_con_kr['IMPORT_EXPORT'] == target_name_u)][
+                    ['ym', 'TEU_FILL']]
+                data['ym'] = pd.to_datetime(data['ym'])
+                merged = data.merge(update, how='left', on='ym')
+                merged['TEU_FILL'].fillna(merged[con_target_name], inplace=True)
+                data = merged.drop(con_target_name, axis=1)
+                data.rename(columns={'TEU_FILL': con_target_name}, inplace=True)
+                new_data_end_date = datetime.datetime.strptime(kmi_update[:4] + '-' + kmi_update[4:6],
+                                                               "%Y-%m").strftime('%Y-%m')
+                # test start date 생성
+                test_start_date = str(np.datetime64(train_end_date_s) + np.timedelta64(1, 'M'))
+                # test end date 생성
+                test_end_date = str(np.datetime64(test_start_date) + np.timedelta64(short_pred_year, 'Y'))
+                ### 모델 학습
+                anal_df = data.copy()
+                pred_df_s = model_running(short_model, model_data=anal_df, item_name=item_name,
+                                          target_name=con_target_name,
+                                          date_name=date_name, train_start_date=train_start_date_s,
+                                          train_end_date=train_end_date_s,
+                                          test_start_date=test_start_date, test_end_date=test_end_date)
+                if short_model == long_model:
+                    pred_df = pred_df_s.copy()
+                else:
+                    print(f'### {item_name} {con_target_name} 오류 ###')
+           ################################### 다른 품목 ###########################################
+           else:
+                if item_name == 'container' and target_name == '환적':
+                    con_target_name = '적_환적'
+                else:
+                    pass 
+                
+                컨테이너 주석 처리 """ 
+                
+           else:
+               pass
+           ################################### 결과 csv 저장 ###########################################
+           try:
+                if item_name == 'container':
+                    target_name_eng = target_name_change(item_name=item_name, target_name=con_target_name)
+                else:
+                    target_name_eng = target_name_change(item_name=item_name, target_name=target_name)
+                # file_li = os.listdir(path)
+                # file_li = [x for x in file_li if f'MART_{item_name.upper()}_{target_name_eng.upper()}_KR.csv' in x]
+                # bottom-up 모델 예측 결과 저장 제외
+                #if len(file_li) >= 1:
+                if item_name == 'coal' and target_name == '연안': pass
+                else:    
+                    # update 물동량 이후 예측값만 저장
+                    pred_df = datamart_datetype(pred_df, date_name)
+                    pred_df2 = pred_df[pred_df['ym'] > kmi_update[0:4] + '-' + kmi_update[-2:]]
+                    # 예측 결과 저장
+                    if item_name == 'etc':
+                        item_detail = '기계잡화'
+                    else:
+                        item_detail = '전체'
+                    if item_name == 'container':
+                        kr_data, harbor_data = forecast_csv_topdown(pred_df2, percen_df, item_detail, item_name_kr,
+                                                                    con_target_name, 'predict', short_model, fix_test_end,
+                                                                    long_model, fix_test_end_l, kmi_update)
+                    else:
+                        kr_data, harbor_data = forecast_csv_topdown(pred_df2, percen_df, item_detail, item_name_kr,
+                                                                    target_name, 'predict', short_model, fix_test_end,
+                                                                    long_model, fix_test_end_l, kmi_update)
+                    # 모델 학습 시간 저장
+                    runtime = datetime.datetime.now() - now
+                    runtime = runtime.total_seconds() / 60
+                    runtime_df = pd.DataFrame({'item_name': [item_name_kr],
+                                               'target_name': [target_name],
+                                               'harbor_name': ['전국'],
+                                               'model_index': [kmi_update],
+                                               'runtime(minutes)': [runtime]})
+                    if not os.path.exists(f'{save_path}runtime.csv'):
+                        runtime_df.to_csv(f'{save_path}runtime.csv', index=False, mode='w',
+                                          encoding='euc-kr')
+                    else:
+                        runtime_df.to_csv(f'{save_path}runtime.csv', index=False, mode='a',
+                                          encoding='euc-kr', header=False)
+                    # 전국 data 저장
+                    #db write
+                    if item_name == 'container':
+                        kr_data.to_sql(name=con_pred_tb, con=db_connection, if_exists='append', index=False)  
+                        harbor_data.to_sql(name=con_pred_tb, con=db_connection, if_exists='append', index=False)  
+                    else:
+                        kr_data.to_sql(name=rt_pred_tb, con=db_connection, if_exists='append', index=False)  
+                        harbor_data.to_sql(name=rt_pred_tb, con=db_connection, if_exists='append', index=False)  
+                        
+                    print('end: ', item_name, target_name, kmi_update)
+                del pred_df
+           except:
+                pass
+           gc.collect()
+
+   # 모델 학습 시간 저장
+   runtime = datetime.datetime.now() - total_now
+   runtime = runtime.total_seconds() / 60
+   runtime_df = pd.DataFrame({'item_name': '전체',
+                               'target_name': '-',
+                               'harbor_name': '-',
+                               'model_index': [kmi_update],
+                               'runtime(minutes)': [runtime]})
+   if not os.path.exists(f'{save_path}runtime.csv'):
+        runtime_df.to_csv(f'{save_path}runtime.csv', index=False, mode='w',
+                          encoding='euc-kr')
+   else:
+        runtime_df.to_csv(f'{save_path}runtime.csv', index=False, mode='a',
+                          encoding='euc-kr', header=False)
+   print('------ end -------')
+   # DB 연결 닫기
+   conn.close()
+   if conn.closed: print('...DB connection Closed')
+   else: print('...DB connection Open')
+else:
+    print(f'--- kmiDB didnt update!! try after {kmi_update} ---')
+    # DB 연결 닫기
+    conn.close()   
+    gc.collect()
+    if conn.closed: print('...DB connection Closed')
+    else: print('...DB connection Open')
+
+
+
+
+
+
+
+
+
