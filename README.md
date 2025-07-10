@@ -1,1 +1,3 @@
-# kmi_proj_time_series_model
+# 시계열 데이터 분석 및 예측
+
+ㅇㄹㅇㄹ
