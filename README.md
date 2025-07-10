@@ -4,4 +4,4 @@
 
 - Sarndard scaler, MinMax scaler 등 Feature Scaling 수행 
 - 품목별 맞춤형 단변량 및 다변량 장단기 예측 모델 생성 
-- Top-Down 또는 Bottom-up 방식을 활용한 항만별 물동량 예측 
+- Top-Down 또는 Bottom-up 방식을 활용한 항만별 물동량 배분
